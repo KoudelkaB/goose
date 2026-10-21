@@ -825,11 +825,6 @@ GS_API void gs_rt_start(int argc, char **argv, uint64_t reserve, uint64_t gap,
                         uint64_t budget, int64_t mainregions, int64_t workerregions);
 /* A fresh region, registered to the calling thread program. */
 GS_API uint8_t *gs_reserve_region(gs_stack *stack);
-/* Discard unused complete pages of this thread program's data stacks.
-   For generated code only (os.trim_memory), whose callers write back their
-   cached tops first; C called from Goose must not call it. 0 means an OS
-   request failed; a top outside its region panics. */
-GS_API uint8_t gs_trim_memory(void);
 /* The calling thread program's stack use, on stderr (GS_STACK_STATS):
    `stacks` is how many of its indexed data stacks exist. */
 GS_API void gs_stack_stats(int64_t stacks);

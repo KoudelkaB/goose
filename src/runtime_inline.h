@@ -841,11 +841,6 @@ GS_API void gs_rt_start(int argc, char **argv, uint64_t reserve, uint64_t gap,
                         uint64_t budget, int64_t mainregions, int64_t workerregions);
 /* A fresh region, registered to the calling thread program. */
 GS_API uint8_t *gs_reserve_region(gs_stack *stack);
-/* Discard unused complete pages of this thread program's data stacks.
-   For generated code only (os.trim_memory), whose callers write back their
-   cached tops first; C called from Goose must not call it. 0 means an OS
-   request failed; a top outside its region panics. */
-GS_API uint8_t gs_trim_memory(void);
 /* The calling thread program's stack use, on stderr (GS_STACK_STATS):
    `stacks` is how many of its indexed data stacks exist. */
 GS_API void gs_stack_stats(int64_t stacks);
@@ -886,13 +881,13 @@ GS_API int64_t gs_hardware_threads(void);
    abort ends run early. */
 GS_API int64_t gs_thread_start(void (*run)(void (*)(uint8_t *), uint8_t *),
                                void (*release)(void), void (*entry)(uint8_t *),
-)GSRT"
-R"GSRT(                               const void *args, int64_t argsize, int contained);
+                               const void *args, int64_t argsize, int contained);
 /* Whether the worker returned rather than aborted, once it has ended. Where
    `msg` is not NULL, the first such wait for a worker that aborted takes its
    message: `msg` and `len` are set to it, which the caller frees with
    gs_free_msg, or to NULL and no bytes. */
-GS_API uint8_t gs_thread_wait(int64_t id, uint8_t **msg, int64_t *len,
+)GSRT"
+R"GSRT(GS_API uint8_t gs_thread_wait(int64_t id, uint8_t **msg, int64_t *len,
                                const char *file, int line);
 GS_API void gs_free_msg(uint8_t *msg);
 
@@ -1082,8 +1077,7 @@ static int64_t gs_zig_write(uint8_t *p, int64_t v) {
 
 /* The ULEB128 at p, or 0 if it runs past `end`, past ten bytes, or carries
    payload bits above the 64th, or is not shortest. The result is the byte count. */
-)GSRT"
-R"GSRT(static int64_t gs_uleb_check(const uint8_t *p, const uint8_t *end, uint64_t *out) {
+static int64_t gs_uleb_check(const uint8_t *p, const uint8_t *end, uint64_t *out) {
     uint64_t v = 0;
     int shift = 0;
     const uint8_t *q = p;
@@ -1093,7 +1087,8 @@ R"GSRT(static int64_t gs_uleb_check(const uint8_t *p, const uint8_t *end, uint64
         b = *q++;
         if (shift > 63 || (shift == 63 && (b & 0x7e))) return 0;
         v |= (uint64_t)(b & 0x7f) << shift;
-        if (!(b & 0x80)) {
+)GSRT"
+R"GSRT(        if (!(b & 0x80)) {
             if (shift && !b) return 0;  /* Redundant high zero group. */
             break;
         }
@@ -3628,6 +3623,14 @@ GS_API int64_t gs_os_time_ns(void);
 GS_API int64_t gs_os_clock_ns(void);
 GS_API void gs_os_sleep_ms(int64_t ms);
 GS_API uint64_t gs_os_random_u64(void);
+/* os.trim_memory: discards unused complete pages of this thread program's
+   data stacks. Defined with the region registry it walks (runtime_impl.h),
+   but declared here like the other os primitives, so that no prototype is
+)GSRT"
+R"GSRT(   emitted for it. For generated code only, whose callers write back their
+   cached tops first; C called from Goose must not call it. 0 means an OS
+   request failed; a top outside its region panics. */
+GS_API uint8_t gs_trim_memory(void);
 )GSRT"
     ) },
     { "runtime_os.h", string_view(

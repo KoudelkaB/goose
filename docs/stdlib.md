@@ -596,11 +596,14 @@ views, limited-array capacity and virtual-address reservations; subsequent
 growth works normally. It affects no other worker. Use it after a large
 workload, such as replacing a document, rather than on every temporary:
 ordinary scope exit still keeps pages available for cheap reuse, while
-trimmed pages cost a fault and fresh zeroed pages when the stack grows
-again. The release is eager: Windows decommits the pages, returning their
-commit charge too, and Linux drops them from the resident set at once;
-macOS marks them reusable, which takes them out of the footprint. `false`
-means at least one OS request failed.
+trimmed pages cost a fault when the stack grows again. The release is
+eager: Windows decommits the pages, returning their commit charge too, and
+Linux drops them from the resident set at once, so either gives growth
+fresh zeroed pages. macOS marks them reusable, which takes them out of the
+footprint at once, and declares them reused as growth takes them back; a
+page the kernel has not reclaimed by then may still hold its old bytes,
+which nothing above a stack's top ever reads. `false` means at least one OS
+request failed.
 
 Paths are UTF-8 on every platform: on Windows the runtime converts them to
 UTF-16 for the system's wide APIs. So are environment values, and the
