@@ -1,7 +1,9 @@
-/* Direct runtime checks: actually decommit unused Windows pages (and drop
-   them from Linux's resident set), keep live partial pages and other
-   stacks, and recommit through the fault handler. This runs beside the
-   Goose fixture in both CI profiles. */
+/* Direct runtime checks: actually decommit unused Windows pages, drop them
+   from Linux's resident set, and on macOS mark them reusable and declare
+   them reused as growth reopens them; keep live partial pages and other
+   stacks, and commit again through the fault handler (Windows and macOS)
+   behind a commit mark that follows each trim. This runs beside the Goose
+   fixtures in both CI profiles. */
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>

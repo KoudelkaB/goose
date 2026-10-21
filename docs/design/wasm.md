@@ -79,9 +79,9 @@ already uses to cap `hardware_threads()`.
   400 MB per stack. Workers multiply the count.
 * **Sizing from a profile.** Each stack index's high-water mark from a
   representative run could size the partitions unevenly. A native run can
-  collect it cheaply: on Windows the fault handler commits on demand and so
-  knows each region's depth, and POSIX can record the highest top as a region
-  is released. `GS_STACK_STATS` reports only counts today. Stack numbering is
+  collect it cheaply: on Windows and macOS the fault handler commits on
+  demand and so knows each region's depth (its commit mark), and Linux can
+  record the highest top as a region is released. `GS_STACK_STATS` reports only counts today. Stack numbering is
   specific to one build, and a profile fits one input; the inputs that
   overflow are the large ones.
 * **The open end.** The partition at the end of linear memory can keep

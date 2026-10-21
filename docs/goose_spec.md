@@ -4426,14 +4426,16 @@ is that header's `len`, so its tail cannot be referenced either.
 
 ### C.4 Guard pages and commit order
 
-Construction rules (§4.2) write stacks front-to-back. When an allocation
-skips ahead without writing (a large limited-array capacity), the runtime
-commits the skipped range explicitly (VirtualAlloc/mprotect) instead of
-relying on touch order — Windows-style guard-page auto-commit covers the
-ordinary sequential-write case; Linux uses reserve + explicit commit.
-Fresh pages arrive zeroed from the OS; reused stack memory does not —
-harmless, since uninitialized slots are unreachable (§5.3). A final
-unmapped gap after each region turns runaway growth into a safe abort.
+Construction rules (§4.2) write stacks front-to-back. Windows and macOS
+commit on fault: the runtime's handler commits a chunk from whichever page
+was touched, so an allocation that skips ahead without writing (a large
+limited-array capacity) needs no explicit commit, and nothing depends on
+touch order. Linux reserves with overcommit and commits on touch. Fresh
+pages arrive zeroed from the OS; reused stack memory does not, nor on
+macOS a page that `trim_memory` released and the kernel has not reclaimed
+yet — harmless, since uninitialized slots are unreachable (§5.3). A final
+gap after each region, never committed, turns runaway growth into a safe
+abort.
 
 ---
 
