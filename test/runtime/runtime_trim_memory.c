@@ -69,10 +69,16 @@ int main(int argc, char **argv) {
               info.State == MEM_RESERVE, "last used page decommitted");
         check(VirtualQuery(base + r0->usable, &info, sizeof info) != 0 &&
               info.State == MEM_RESERVE, "guard gap remains uncommitted");
+#endif
+#if defined(_WIN32) || defined(GS_POSIX_COMMIT_ON_FAULT)
         /* The next trim starts its walk from here, not the reservation's end. */
         check(r0->committed == base + start, "commit mark follows the trim");
 #else
         (void)r0;
+#endif
+#ifdef GS_POSIX_COMMIT_ON_FAULT
+        check(r0->reuse_lo == base + start && r0->reuse_hi >= base + count,
+              "trimmed pages are recorded as reusable");
 #endif
 #ifdef __linux__
         check(!resident(base + start), "unused page leaves the resident set");
@@ -86,10 +92,26 @@ int main(int argc, char **argv) {
         GS(0)->top = base + count;
         memset(base + keep, 93, count - keep);
         for (size_t i = keep; i < count; i++) check(base[i] == 93, "regrowth recommits");
-#ifdef _WIN32
+#if defined(_WIN32) || defined(GS_POSIX_COMMIT_ON_FAULT)
         check(r0->committed >= base + count, "fault handler raises the commit mark");
 #endif
+#ifdef GS_POSIX_COMMIT_ON_FAULT
+        /* Every page growth took back was declared reused (MADV_FREE_REUSE). */
+        check(!r0->reuse_hi || r0->reuse_lo >= base + count, "regrowth declares pages reused");
+#endif
     }
+    /* Growth that skips pages leaves a stretch below the commit mark that
+       was never committed (or, on macOS, opened); a trim over it works. */
+    GS(0)->top = base + 1;
+    check(gs_trim_memory(), "trim before skipping pages");
+    GS(0)->top = base + (8u << 20);
+    base[(8u << 20) - 1] = 7;
+    GS(0)->top = base + 1;
+    check(gs_trim_memory(), "trim over skipped pages");
+    check(base[0] == 85, "live byte survives a trim over skipped pages");
+#if defined(_WIN32) || defined(GS_POSIX_COMMIT_ON_FAULT)
+    check(r0->committed == base + gs_page_size, "skipped pages trimmed to the mark");
+#endif
     /* As a thread program's end does: its stack block, then its regions. */
     gs_thread_release();
     gs_release_regions();

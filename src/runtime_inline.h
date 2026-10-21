@@ -1357,11 +1357,15 @@ typedef struct {
     uint8_t *base;
     size_t usable, size;    /* size: with the guard gap */
     gs_stack *stack;       /* Stable descriptor of the owning data stack. */
-    /* Windows: one past the highest page the fault handler has committed,
-       so gs_trim_memory decommits only what was ever committed rather than
-       walking the whole reservation. Unused on POSIX, which commits on
-       touch with no fault to note it. */
+    /* Windows and macOS: one past the highest page the fault handler has
+       committed, so gs_trim_memory releases only what was ever committed
+       rather than walking the whole reservation. Unused on Linux, which
+       commits on touch with no fault to note it. */
     uint8_t *committed;
+    /* macOS: pages gs_trim_memory marked reusable that growth has not
+       committed again yet, or both NULL. The fault handler declares them
+       reused (MADV_FREE_REUSE) as it reopens them. */
+    uint8_t *reuse_lo, *reuse_hi;
 } gs_region;
 static GS_TLS gs_region *gs_regions;
 static GS_TLS volatile long gs_nregions;
@@ -1562,13 +1566,13 @@ static GS_NORETURN void gs_park(void) {
 
 #include <sys/mman.h>
 #include <unistd.h>
-#include <signal.h>
+)GSRT"
+R"GSRT(#include <signal.h>
 #include <pthread.h>
 
 /* The calling thread's native stack, from GS_NATIVE_SLOP below its lowest
    usable address up to its top: a fault in there is that stack overflowing,
-)GSRT"
-R"GSRT(   whether on the guard below it or at a limit the kernel would not grow it
+   whether on the guard below it or at a limit the kernel would not grow it
    past. The slop covers a frame larger than the guard reaching over it.
    Empty where the platform cannot tell. */
 #define GS_NATIVE_SLOP (64u << 10)
@@ -1579,12 +1583,54 @@ static GS_TLS void *gs_sigstack;
 /* What the fault handler replaced, for the faults that are not its own. */
 static struct sigaction gs_prev_segv, gs_prev_bus;
 
+/* For gs_trim_memory, which discards whole pages only, and the commit. */
+static size_t gs_page_size = 0;
+
+/* macOS commits as Windows does: a region's usable part starts PROT_NONE
+   (gs_os_reserve) and the fault handler opens it a chunk at a time. XNU's
+   madvise visits every page of its range, populated or not, so without a
+   commit mark a trim would cost time in proportion to the reservation; and
+   pages trimmed as reusable have to be declared reused when growth takes
+   them back, or the footprint goes on leaving them out. Opening them
+   through the handler is what gives growth that point. Runtime C only ever
+   writes a stack from user mode (memcpy, gs_bld_append), as Windows
+   already requires, so a system call never meets an unopened page. */
+#if defined(__APPLE__) && defined(MADV_FREE_REUSABLE) && defined(MADV_FREE_REUSE)
+#define GS_POSIX_COMMIT_ON_FAULT 1
+#define GS_COMMIT_CHUNK (1u << 20)
+
+/* Opens the chunk at hit (clamped to the region), declaring any of it
+   gs_trim_memory left reusable reused; whether it could. */
+static int gs_commit_chunk(gs_region *r, uint8_t *hit) {
+    uint8_t *page = (uint8_t *)((uintptr_t)hit & ~(uintptr_t)(gs_page_size - 1));
+    size_t n = GS_COMMIT_CHUNK;
+    if (page + n > r->base + r->usable) n = (size_t)(r->base + r->usable - page);
+    /* Writable first: XNU refuses reuse advice on a page that is not. */
+    if (mprotect(page, n, PROT_READ | PROT_WRITE)) return 0;
+    if (page < r->reuse_hi && page + n > r->reuse_lo) {
+        uint8_t *lo = page > r->reuse_lo ? page : r->reuse_lo;
+        uint8_t *hi = page + n < r->reuse_hi ? page + n : r->reuse_hi;
+        /* Only the accounting depends on it: the pages are usable either way. */
+        madvise(lo, (size_t)(hi - lo), MADV_FREE_REUSE);
+        if (lo == r->reuse_lo) r->reuse_lo = hi;
+        if (r->reuse_lo >= r->reuse_hi) r->reuse_lo = r->reuse_hi = NULL;
+    }
+    if (page + n > r->committed) r->committed = page + n;
+    return 1;
+}
+#endif
+
 static void gs_fault_handler(int sig, siginfo_t *info, void *ctx) {
     (void)ctx;
     uint8_t *hit = (uint8_t *)info->si_addr;
     for (long i = 0; i < gs_nregions; i++) {
-        const gs_region *r = &gs_regions[i];
+        gs_region *r = &gs_regions[i];
         if ((uintptr_t)hit - (uintptr_t)r->base < r->size) {
+            /* Within the usable part: open another chunk and resume. Within
+               the gap, or where it cannot be opened: a data stack overran. */
+#ifdef GS_POSIX_COMMIT_ON_FAULT
+            if (hit < r->base + r->usable && gs_commit_chunk(r, hit)) return;
+#endif
             char msg[GS_OVERFLOW_TEXT];
             ssize_t w = write(2, msg, gs_overflow_text(msg, r));
             (void)w;
@@ -1607,9 +1653,6 @@ static size_t gs_os_page_size(void) {
     long n = sysconf(_SC_PAGESIZE);
     return n > 0 ? (size_t)n : 4096;
 }
-
-/* For gs_trim_memory, which discards whole pages only. */
-static size_t gs_page_size = 0;
 
 static void gs_regions_init(void) {
     gs_page_size = gs_os_page_size();
@@ -1686,8 +1729,15 @@ static void gs_native_stack_free(void) {
 /* Address space for one region, or NULL where the platform has none left
    to give: its address space or an address-space limit exhausted, or
    strict overcommit accounting, which counts even a MAP_NORESERVE mapping.
-   Commit-on-touch via overcommit; the gap at the end stays PROT_NONE. */
+   Commit-on-touch via overcommit; the gap at the end stays PROT_NONE. On
+   macOS all of it starts PROT_NONE, and the fault handler opens the usable
+   part as the stack grows (GS_POSIX_COMMIT_ON_FAULT). */
 static uint8_t *gs_os_reserve(size_t usable, size_t size) {
+#ifdef GS_POSIX_COMMIT_ON_FAULT
+    void *p = mmap(NULL, size, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (p == MAP_FAILED) return NULL;
+    (void)usable;
+#else
     void *p = mmap(NULL, size, PROT_READ | PROT_WRITE,
                    MAP_PRIVATE | MAP_ANONYMOUS
                    #ifdef MAP_NORESERVE
@@ -1699,6 +1749,7 @@ static uint8_t *gs_os_reserve(size_t usable, size_t size) {
         munmap(p, size);
         gs_panic("cannot protect data stack guard gap");
     }
+#endif
     /* Most stacks hold a few bytes, which a transparent huge page at the
        start would commit 2 MB for. */
     #ifdef MADV_NOHUGEPAGE
@@ -1711,7 +1762,8 @@ static void gs_release_region(const gs_region *r) {
     if (munmap(r->base, r->size)) gs_panic("cannot release data stack address space");
 }
 
-/* Whether this is the first call of gs_end; and where the later ones wait.
+)GSRT"
+R"GSRT(/* Whether this is the first call of gs_end; and where the later ones wait.
    TinyCC names the memory orders in its stdatomic.h alone. */
 #ifndef __ATOMIC_SEQ_CST
 #define __ATOMIC_SEQ_CST 5
@@ -1765,6 +1817,7 @@ GS_API uint8_t *gs_reserve_region(gs_stack *stack) {
     gs_regions[i].size = usable + gs_region_gap;
     gs_regions[i].stack = stack;
     gs_regions[i].committed = p;
+    gs_regions[i].reuse_lo = gs_regions[i].reuse_hi = NULL;
     gs_nregions = i + 1;  /* Publish only the initialized entry. */
     return p;
 }
@@ -1779,9 +1832,9 @@ GS_API uint8_t *gs_reserve_region(gs_stack *stack) {
    well as the physical pages (DiscardVirtualMemory and MEM_RESET keep the
    charge), and Linux's MADV_DONTNEED drops the pages from RSS at once,
    where MADV_FREE leaves them counted until the kernel is short of memory.
-)GSRT"
-R"GSRT(   On macOS MADV_DONTNEED reclaims nothing reliably; MADV_FREE_REUSABLE is
-   what makes the footprint drop there.
+   On macOS MADV_DONTNEED reclaims nothing reliably; MADV_FREE_REUSABLE is
+   what makes the footprint drop there, paired with MADV_FREE_REUSE when
+   the fault handler reopens the pages (gs_commit_chunk).
 
    Only generated code may call this, through os.trim_memory, whose callers
    publish their cached tops first (SFunction::readsalltops). C reached
@@ -1799,25 +1852,48 @@ GS_API uint8_t gs_trim_memory(void) {
             gs_panic("data stack top outside its region in trim_memory");
         uintptr_t start = (top + page - 1) / page * page;
         uintptr_t end = (base + r->usable) / page * page;
-#ifdef _WIN32
+#if defined(_WIN32) || defined(GS_POSIX_COMMIT_ON_FAULT)
         /* Nothing above the commit mark was ever committed (base is
            allocation-aligned and the mark page-aligned). */
         if ((uintptr_t)r->committed < end) end = (uintptr_t)r->committed;
+#endif
         if (start >= end) continue;
+        size_t len = (size_t)(end - start);
+#ifdef _WIN32
         /* The access-fault handler commits the pages again on growth. */
-        if (VirtualFree((void *)start, (size_t)(end - start), MEM_DECOMMIT))
+        if (VirtualFree((void *)start, len, MEM_DECOMMIT))
             r->committed = (uint8_t *)start;
         else
             ok = 0;
+#elif defined(GS_POSIX_COMMIT_ON_FAULT)
+        /* Reusable while writable, which XNU requires; then closed, so that
+           growth faults and gs_commit_chunk declares them reused. A growth
+           that skipped pages can leave a closed stretch below the mark, so
+           the range is opened first (which commits nothing). */
+        if (mprotect((void *)start, len, PROT_READ | PROT_WRITE) ||
+            madvise((void *)start, len, MADV_FREE_REUSABLE)) {
+            ok = 0;
+            continue;
+        }
+        if (mprotect((void *)start, len, PROT_NONE)) {
+            /* Still open, so nothing would declare them reused: undo. */
+            madvise((void *)start, len, MADV_FREE_REUSE);
+            ok = 0;
+            continue;
+        }
+        r->committed = (uint8_t *)start;
+        if (!r->reuse_hi) {
+            r->reuse_lo = (uint8_t *)start;
+            r->reuse_hi = (uint8_t *)end;
+        } else {
+            /* A cover of both: declaring a page reused twice is harmless. */
+            if ((uint8_t *)start < r->reuse_lo) r->reuse_lo = (uint8_t *)start;
+            if ((uint8_t *)end > r->reuse_hi) r->reuse_hi = (uint8_t *)end;
+        }
 #else
-        if (start >= end) continue;
-        /* An untouched stretch costs the kernel little: it skips page
-           tables that were never populated. */
-    #if defined(__APPLE__) && defined(MADV_FREE_REUSABLE)
-        if (madvise((void *)start, (size_t)(end - start), MADV_FREE_REUSABLE)) ok = 0;
-    #else
-        if (madvise((void *)start, (size_t)(end - start), MADV_DONTNEED)) ok = 0;
-    #endif
+        /* Linux walks only the page tables that were ever populated, so the
+           untouched rest of the reservation costs it little. */
+        if (madvise((void *)start, len, MADV_DONTNEED)) ok = 0;
 #endif
     }
     return (uint8_t)ok;
@@ -1864,7 +1940,8 @@ typedef struct {
 #define GS_SPLEAF(p, i) ((gs_spleaf *)((p)->base + (i) * GS_SPAN_NODE))
 #define GS_SPINNER(p, i) ((gs_spinner *)((p)->base + (i) * GS_SPAN_NODE))
 
-static int64_t gs_sp_newnode(gs_sppath *p) {
+)GSRT"
+R"GSRT(static int64_t gs_sp_newnode(gs_sppath *p) {
     int64_t i = GS_SPHEAD(p)->chain;
     if (i) {
         GS_SPHEAD(p)->chain = GS_SPLEAF(p, i)->link;
@@ -1982,8 +2059,7 @@ static int64_t gs_sp_find(gs_sppath *p, int64_t idx) {
     return k - 1;
 }
 
-)GSRT"
-R"GSRT(/* A node full at the root splits under a new root of the two halves. */
+/* A node full at the root splits under a new root of the two halves. */
 static void gs_sp_newroot(gs_sppath *p, int64_t a, int64_t b, int leaf) {
     int64_t r = gs_sp_newnode(p);
     gs_spinner *rn = GS_SPINNER(p, r);
@@ -2105,7 +2181,8 @@ static void gs_sp_delete(gs_sppath *p, int64_t k) {
 }
 
 /* Takes cnt elements off the front of the span at position k of the path's
-   leaf, or the whole span where it holds no more. */
+)GSRT"
+R"GSRT(   leaf, or the whole span where it holds no more. */
 static void gs_sp_take(gs_sppath *p, int64_t k, int64_t cnt) {
     gs_spleaf *lf = GS_SPLEAF(p, p->node[p->h]);
     int64_t c = lf->cnt[k];
@@ -2212,8 +2289,7 @@ GS_API int64_t gs_spans_alloc(uint8_t *base, int64_t *n, uint8_t **top, int64_t 
 
 /* The spans around a run [idx, end): the path to the leaf holding the last
    span that starts at or before idx (its position k there, or -1), and the
-)GSRT"
-R"GSRT(   span after that one where it follows in the same leaf, or where it starts
+   span after that one where it follows in the same leaf, or where it starts
    the next leaf and at end (nl and nk, reached by the path np). A next
    leaf's first index is the key of the entry that leads to it, so a path
    to it is only made where its first span touches the run. */
@@ -2328,7 +2404,8 @@ GS_API int64_t gs_spans_regrow(uint8_t *base, int64_t *n, uint8_t **top, int64_t
 
 /* ---------------------------------------------------------------------------
    Byte search: std's find_any and find_pair (docs/stdlib.md). A set arrives
-   as std's ByteSet, made by its byte_set, which gs_byteset lays out as the
+)GSRT"
+R"GSRT(   as std's ByteSet, made by its byte_set, which gs_byteset lays out as the
    Goose struct is (spec C.2: packed, in declaration order). `members` is
    the set. `kind` says how a block of bytes is tested for it: by comparing
    with 1 to 3 of `bytes` (kinds 1-3), or as the range bytes[0] .. bytes[0] +
@@ -2428,8 +2505,7 @@ static GS_INLINE void gs_bsm_init(gs_bsm *m, const gs_byteset *s, int tables) {
         m->flip = _mm_setzero_si128();
     } else {
         m->a = _mm_set1_epi8((char)s->bytes[0]);
-)GSRT"
-R"GSRT(        m->b = _mm_set1_epi8((char)s->bytes[1]);
+        m->b = _mm_set1_epi8((char)s->bytes[1]);
         m->c = _mm_set1_epi8((char)s->bytes[2]);
         m->flip = s->invert ? _mm_set1_epi8(-1) : _mm_setzero_si128();
     }
@@ -2507,7 +2583,8 @@ static GS_INLINE int64_t gs_scan_any_k(const uint8_t *p, int64_t n, const gs_byt
     GS_ANY_LOOP(GS_TEST_S)
 }
 
-static GS_SSSE3 int64_t gs_scan_any_tables(const uint8_t *p, int64_t n, const gs_byteset *s) {
+)GSRT"
+R"GSRT(static GS_SSSE3 int64_t gs_scan_any_tables(const uint8_t *p, int64_t n, const gs_byteset *s) {
     gs_bsm ms;
     gs_bsm_init(&ms, s, 1);
     GS_ANY_LOOP(GS_TABLES_S)
@@ -2596,8 +2673,7 @@ GS_API void gs_rt_start(int argc, char **argv, uint64_t reserve, uint64_t gap,
     if (!reserve) gs_panic("the data stack reservation (GS_STACK_RESERVE) is less than a page");
     gs_region_usable = gs_region_reserve = (size_t)reserve;
     gs_region_gap = (size_t)gap;
-)GSRT"
-R"GSRT(    gs_stack_budget = budget;
+    gs_stack_budget = budget;
     gs_mainregions = mainregions;
     gs_workerregions = workerregions;
     /* The workers the budget holds beside the main program, each at the
@@ -2698,7 +2774,8 @@ typedef struct { int n; uint32_t d[36]; } gs_big;
 /* a = v << sh, for v > 0. */
 static void gs_big_set(gs_big *a, uint64_t v, int sh) {
     int w = sh >> 5, b = sh & 31, i;
-    uint64_t lo = v << b, hi = b ? v >> (64 - b) : 0;
+)GSRT"
+R"GSRT(    uint64_t lo = v << b, hi = b ? v >> (64 - b) : 0;
     for (i = 0; i < w; i++) a->d[i] = 0;
     a->d[w] = (uint32_t)lo;
     a->d[w + 1] = (uint32_t)(lo >> 32);
@@ -2807,8 +2884,7 @@ static int gs_float_digits(uint64_t f, int e, int bits, int emin, char *dig, int
         if (!low && !high) {
             dig[n++] = (char)('0' + d);
             continue;
-)GSRT"
-R"GSRT(        }
+        }
         if (low && high) {
             /* Both read back: the nearer, d + 1 when r is past half of s,
                and of two as near, the even one. */
