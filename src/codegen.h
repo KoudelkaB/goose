@@ -450,6 +450,7 @@ struct CodeGen {
         set<const VarDef *> globals; // Transitively touched stack/fat-reference globals.
         bool needssp = false;
         bool hasrf = false;
+        bool trims_memory = false;   // Transitively reads every data-stack top.
         int cret = -1;               // Ret index returned as the C value.
     };
     unordered_map<FnSpec *, SpecInfo> sinfo;

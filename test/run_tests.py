@@ -1803,10 +1803,9 @@ def main():
 
         # Direct runtime lifecycle checks use small region limits and allocator
         # instrumentation that cannot be expressed by a Goose program. Keep
-        # this one focused native test in both profiles.
-        def runtime_lifecycle():
-            name = "runtime_threads_lifecycle"
-            src = HERE / "threads" / f"{name}.c"
+        # these focused native tests in both profiles.
+        def runtime_lifecycle(name, directory):
+            src = HERE / directory / f"{name}.c"
             out_exe = gendir / f"{name}{tc.EXE_SUFFIX}"
             ok, log = cc.compile(src, out_exe, opt=2 if args.profile == "baseline" else 1,
                                  extra=extra, strict_decls=True,
@@ -1817,7 +1816,8 @@ def main():
                 out = r.run_expected([out_exe], name, name)
                 if out is not None and r.check_stdout(name, name, out):
                     r.ok(f"runtime {name}")
-        r.show_task(runtime_lifecycle)
+        r.show_task(runtime_lifecycle, "runtime_threads_lifecycle", "threads")
+        r.show_task(runtime_lifecycle, "runtime_trim_memory", "runtime")
 
         # The same coverage test through clang, release and debug. A compiler
         # that accepts more C than the standard does is not what checks the

@@ -195,6 +195,7 @@ static int64_t gs_thread_cap = INT64_MAX;
 typedef struct {
     uint8_t *base;
     size_t usable, size;    /* size: with the guard gap */
+    gs_stack *stack;       /* Stable descriptor of the owning data stack. */
 } gs_region;
 static GS_TLS gs_region *gs_regions;
 static GS_TLS volatile long gs_nregions;
@@ -572,7 +573,7 @@ static GS_NORETURN void gs_end(int code) {
    sooner. Workers racing through a refusal may each halve the size once
    more than needed, or restore a larger one for a moment; it only ever
    settles downward. */
-GS_API uint8_t *gs_reserve_region(void) {
+GS_API uint8_t *gs_reserve_region(gs_stack *stack) {
     if (gs_nregions >= gs_regions_cap)
         gs_panic("too many data stack regions");
     size_t usable = gs_region_usable;
@@ -589,8 +590,41 @@ GS_API uint8_t *gs_reserve_region(void) {
     gs_regions[i].base = p;
     gs_regions[i].usable = usable;
     gs_regions[i].size = usable + gs_region_gap;
+    gs_regions[i].stack = stack;
     gs_nregions = i + 1;  /* Publish only the initialized entry. */
     return p;
+}
+
+/* Explicit rather than on every rewind: short-lived scratch can reuse its
+   pages cheaply, while a long-running application can give them back after
+   replacing a large document. Keep the virtual reservation and the partly
+   used final page; limited-array capacity and live borrowed values are below
+   the synchronized top and remain intact. Each worker has its own registry. */
+GS_API uint8_t gs_trim_memory(void) {
+#ifdef _WIN32
+    size_t page = gs_page_size;
+#else
+    long page_size = sysconf(_SC_PAGESIZE);
+    if (page_size <= 0) return 0;
+    size_t page = (size_t)page_size;
+#endif
+    int ok = 1;
+    for (long i = 0; i < gs_nregions; i++) {
+        const gs_region *r = &gs_regions[i];
+        uintptr_t base = (uintptr_t)r->base, top = (uintptr_t)r->stack->top;
+        if (top < base || top - base > r->usable) { ok = 0; continue; }
+        uintptr_t start = (top + page - 1) / page * page;
+        uintptr_t end = (base + r->usable) / page * page;
+        if (start >= end) continue;
+#ifdef _WIN32
+        /* Decommitting reserved, already uncommitted pages is harmless.
+           The existing access-fault handler commits them again on growth. */
+        if (!VirtualFree((void *)start, (size_t)(end - start), MEM_DECOMMIT)) ok = 0;
+#else
+        if (madvise((void *)start, (size_t)(end - start), MADV_DONTNEED)) ok = 0;
+#endif
+    }
+    return (uint8_t)ok;
 }
 
 /* ---------------------------------------------------------------------------

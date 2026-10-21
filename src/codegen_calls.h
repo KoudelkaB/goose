@@ -102,7 +102,9 @@ inline vector<string> CodeGen::EmitExternCall(Call *c, FnSpec *sp) {
     // to by the C side through its stack's top, so a cached top is written
     // back before the call and read again after it, as for a call into
     // Goose code.
-    auto grows = false;
+    // This no-argument runtime call reads every top, including callers'
+    // cached locals. Its effect also propagates through ordinary helpers.
+    auto grows = sp->sf->cname == "gs_trim_memory";
     for (size_t i = 0; i < an.size(); i++) {
         auto pt = sp->argtypes[i];
         if (i) argstr += ", ";

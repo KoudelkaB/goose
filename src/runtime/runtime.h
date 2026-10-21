@@ -824,7 +824,10 @@ typedef struct {
 GS_API void gs_rt_start(int argc, char **argv, uint64_t reserve, uint64_t gap,
                         uint64_t budget, int64_t mainregions, int64_t workerregions);
 /* A fresh region, registered to the calling thread program. */
-GS_API uint8_t *gs_reserve_region(void);
+GS_API uint8_t *gs_reserve_region(gs_stack *stack);
+/* Discard unused complete pages of this thread program's data stacks.
+   Generated callers synchronize cached tops before entering the runtime. */
+GS_API uint8_t gs_trim_memory(void);
 /* The calling thread program's stack use, on stderr (GS_STACK_STATS):
    `stacks` is how many of its indexed data stacks exist. */
 GS_API void gs_stack_stats(int64_t stacks);
@@ -914,7 +917,7 @@ static GS_TLS void *gs_gl;
 #define GS(i) (&gs_stks[i])
 
 static void gs_stack_init(gs_stack *s) {
-    s->top = gs_reserve_region();
+    s->top = gs_reserve_region(s);
 }
 
 /* The calling thread program's block of n stacks, each with its region:

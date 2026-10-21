@@ -840,7 +840,10 @@ typedef struct {
 GS_API void gs_rt_start(int argc, char **argv, uint64_t reserve, uint64_t gap,
                         uint64_t budget, int64_t mainregions, int64_t workerregions);
 /* A fresh region, registered to the calling thread program. */
-GS_API uint8_t *gs_reserve_region(void);
+GS_API uint8_t *gs_reserve_region(gs_stack *stack);
+/* Discard unused complete pages of this thread program's data stacks.
+   Generated callers synchronize cached tops before entering the runtime. */
+GS_API uint8_t gs_trim_memory(void);
 /* The calling thread program's stack use, on stderr (GS_STACK_STATS):
    `stacks` is how many of its indexed data stacks exist. */
 GS_API void gs_stack_stats(int64_t stacks);
@@ -883,11 +886,11 @@ GS_API int64_t gs_thread_start(void (*run)(void (*)(uint8_t *), uint8_t *),
                                void (*release)(void), void (*entry)(uint8_t *),
                                const void *args, int64_t argsize, int contained);
 /* Whether the worker returned rather than aborted, once it has ended. Where
-   `msg` is not NULL, the first such wait for a worker that aborted takes its
+)GSRT"
+R"GSRT(   `msg` is not NULL, the first such wait for a worker that aborted takes its
    message: `msg` and `len` are set to it, which the caller frees with
    gs_free_msg, or to NULL and no bytes. */
-)GSRT"
-R"GSRT(GS_API uint8_t gs_thread_wait(int64_t id, uint8_t **msg, int64_t *len,
+GS_API uint8_t gs_thread_wait(int64_t id, uint8_t **msg, int64_t *len,
                                const char *file, int line);
 GS_API void gs_free_msg(uint8_t *msg);
 
@@ -931,7 +934,7 @@ static GS_TLS void *gs_gl;
 #define GS(i) (&gs_stks[i])
 
 static void gs_stack_init(gs_stack *s) {
-    s->top = gs_reserve_region();
+    s->top = gs_reserve_region(s);
 }
 
 /* The calling thread program's block of n stacks, each with its region:
@@ -1082,13 +1085,13 @@ static int64_t gs_uleb_check(const uint8_t *p, const uint8_t *end, uint64_t *out
     int shift = 0;
     const uint8_t *q = p;
     for (;;) {
-        uint8_t b;
+)GSRT"
+R"GSRT(        uint8_t b;
         if (q >= end) return 0;
         b = *q++;
         if (shift > 63 || (shift == 63 && (b & 0x7e))) return 0;
         v |= (uint64_t)(b & 0x7f) << shift;
-)GSRT"
-R"GSRT(        if (!(b & 0x80)) {
+        if (!(b & 0x80)) {
             if (shift && !b) return 0;  /* Redundant high zero group. */
             break;
         }
@@ -1351,6 +1354,7 @@ R"GSRT(   halved the size are larger than those after. */
 typedef struct {
     uint8_t *base;
     size_t usable, size;    /* size: with the guard gap */
+    gs_stack *stack;       /* Stable descriptor of the owning data stack. */
 } gs_region;
 static GS_TLS gs_region *gs_regions;
 static GS_TLS volatile long gs_nregions;
@@ -1562,9 +1566,9 @@ static GS_TLS uintptr_t gs_native_lo, gs_native_hi;
 /* The alternate signal stack gs_native_stack_init allocated, if it did. */
 static GS_TLS void *gs_sigstack;
 #define GS_SIGSTACK_MIN (64u << 10)
-/* What the fault handler replaced, for the faults that are not its own. */
 )GSRT"
-R"GSRT(static struct sigaction gs_prev_segv, gs_prev_bus;
+R"GSRT(/* What the fault handler replaced, for the faults that are not its own. */
+static struct sigaction gs_prev_segv, gs_prev_bus;
 
 static void gs_fault_handler(int sig, siginfo_t *info, void *ctx) {
     (void)ctx;
@@ -1729,7 +1733,7 @@ static GS_NORETURN void gs_end(int code) {
    sooner. Workers racing through a refusal may each halve the size once
    more than needed, or restore a larger one for a moment; it only ever
    settles downward. */
-GS_API uint8_t *gs_reserve_region(void) {
+GS_API uint8_t *gs_reserve_region(gs_stack *stack) {
     if (gs_nregions >= gs_regions_cap)
         gs_panic("too many data stack regions");
     size_t usable = gs_region_usable;
@@ -1746,8 +1750,42 @@ GS_API uint8_t *gs_reserve_region(void) {
     gs_regions[i].base = p;
     gs_regions[i].usable = usable;
     gs_regions[i].size = usable + gs_region_gap;
+    gs_regions[i].stack = stack;
     gs_nregions = i + 1;  /* Publish only the initialized entry. */
     return p;
+}
+
+/* Explicit rather than on every rewind: short-lived scratch can reuse its
+   pages cheaply, while a long-running application can give them back after
+   replacing a large document. Keep the virtual reservation and the partly
+   used final page; limited-array capacity and live borrowed values are below
+   the synchronized top and remain intact. Each worker has its own registry. */
+GS_API uint8_t gs_trim_memory(void) {
+#ifdef _WIN32
+    size_t page = gs_page_size;
+#else
+    long page_size = sysconf(_SC_PAGESIZE);
+    if (page_size <= 0) return 0;
+    size_t page = (size_t)page_size;
+#endif
+    int ok = 1;
+    for (long i = 0; i < gs_nregions; i++) {
+        const gs_region *r = &gs_regions[i];
+        uintptr_t base = (uintptr_t)r->base, top = (uintptr_t)r->stack->top;
+        if (top < base || top - base > r->usable) { ok = 0; continue; }
+        uintptr_t start = (top + page - 1) / page * page;
+        uintptr_t end = (base + r->usable) / page * page;
+        if (start >= end) continue;
+#ifdef _WIN32
+        /* Decommitting reserved, already uncommitted pages is harmless.
+           The existing access-fault handler commits them again on growth. */
+        if (!VirtualFree((void *)start, (size_t)(end - start), MEM_DECOMMIT)) ok = 0;
+#else
+)GSRT"
+R"GSRT(        if (madvise((void *)start, (size_t)(end - start), MADV_DONTNEED)) ok = 0;
+#endif
+    }
+    return (uint8_t)ok;
 }
 
 /* ---------------------------------------------------------------------------
@@ -1773,8 +1811,7 @@ GS_API uint8_t *gs_reserve_region(void) {
    of the one before: no freelist gets this deep. */
 #define GS_SPAN_DEPTH 24
 
-)GSRT"
-R"GSRT(/* `link` chains emptied nodes. */
+/* `link` chains emptied nodes. */
 typedef struct { int64_t n, link, idx[GS_SPAN_LEAF], cnt[GS_SPAN_LEAF]; } gs_spleaf;
 typedef struct { int64_t n, link, key[GS_SPAN_FAN], max[GS_SPAN_FAN], child[GS_SPAN_FAN]; } gs_spinner;
 typedef struct { int64_t root, height, chain; } gs_sphead;
@@ -1961,7 +1998,8 @@ static void gs_sp_addchild(gs_sppath *p, int64_t l, int64_t k, int64_t child, in
         }
         /* The node keeps its place above, and its new right half goes
            after it. */
-        gs_sp_fix(p, l, INT64_MAX, 0);
+)GSRT"
+R"GSRT(        gs_sp_fix(p, l, INT64_MAX, 0);
         child = nn;
         leaf = 0;
         k = p->pos[l - 1] + 1;
@@ -2012,8 +2050,7 @@ static void gs_sp_delete(gs_sppath *p, int64_t k) {
     }
     gs_sp_dropnode(p, p->node[p->h]);
     for (l = p->h - 1;; l--) {
-)GSRT"
-R"GSRT(        gs_spinner *in = GS_SPINNER(p, p->node[l]);
+        gs_spinner *in = GS_SPINNER(p, p->node[l]);
         int64_t e = p->pos[l], m = in->max[e];
         gs_sp_closein(in, e);
         if (in->n > 0) {
@@ -2191,7 +2228,8 @@ static void gs_sp_release(gs_sppath *p, gs_spnear *s, int64_t idx, int64_t cnt) 
         lf->cnt[k] = m;
         /* The merged count is larger than both it replaces, so one fix
            covers the span after leaving the leaf as well. */
-        if (next && nl == lf) gs_sp_close(lf, nk);
+)GSRT"
+R"GSRT(        if (next && nl == lf) gs_sp_close(lf, nk);
         gs_sp_fix(p, p->h, c, m);
         if (next && nl != lf) gs_sp_delete(s->np, nk);
     } else if (next) {
@@ -2236,8 +2274,7 @@ GS_API int64_t gs_spans_regrow(uint8_t *base, int64_t *n, uint8_t **top, int64_t
     gs_sppath p, q;
     gs_spnear s;
     int64_t end = idx + ol;
-)GSRT"
-R"GSRT(    if (*n == 0) {
+    if (*n == 0) {
         gs_spans_free(base, n, top, idx, ol);
         return gs_spans_alloc(base, n, top, len, cnt);
     }
@@ -2397,7 +2434,8 @@ static GS_SSSE3 GS_INLINE __m128i gs_bsm_tables(const gs_bsm *m, __m128i x) {
    finds in a block. */
 #define GS_ANY_LOOP(TEST)                                                              \
     int64_t i = 0;                                                                     \
-    unsigned k;                                                                        \
+)GSRT"
+R"GSRT(    unsigned k;                                                                        \
     for (; i + 16 <= n; i += 16) {                                                     \
         k = (unsigned)_mm_movemask_epi8(TEST(GS_LOAD(p + i)));                         \
         if (k) return i + gs_ctz32(k);                                                 \
@@ -2417,8 +2455,7 @@ static GS_SSSE3 GS_INLINE __m128i gs_bsm_tables(const gs_bsm *m, __m128i x) {
     }                                                                                  \
     if (i == np) return -1;                                                            \
     k = (unsigned)_mm_movemask_epi8(_mm_and_si128(TESTA(GS_LOAD(p + np - 16)),         \
-)GSRT"
-R"GSRT(                                                  TESTB(GS_LOAD(p + np - 16 + d))))    \
+                                                  TESTB(GS_LOAD(p + np - 16 + d))))    \
         >> (16 - (np - i));                                                            \
     return k ? i + gs_ctz32(k) : -1;
 
@@ -2564,7 +2601,8 @@ GS_API void gs_rt_start(int argc, char **argv, uint64_t reserve, uint64_t gap,
 /* Integers are written by a digit loop rather than printf, whose locale
    handling and format parsing cost several times the conversion itself:
    the digit count first, then the digits from the right, two per division
-   by 100. */
+)GSRT"
+R"GSRT(   by 100. */
 static const char gs_digit_pairs[201] =
     "00010203040506070809101112131415161718192021222324252627282930313233343536373839"
     "40414243444546474849505152535455565758596061626364656667686970717273747576777879"
@@ -2612,8 +2650,7 @@ GS_API int64_t gs_fmt_i64(uint8_t *dst, int64_t v) {
    same value of its own type and, of those, the ones nearest it, a tie going
    to the even digit (as Python's repr and Ryu choose). They are found in
    integers, by Burger and Dybvig's free-format algorithm, not through the C
-)GSRT"
-R"GSRT(   library: msvcrt, which tcc uses on Windows, rounds a printf tie away from
+   library: msvcrt, which tcc uses on Windows, rounds a printf tie away from
    zero, and below a power of two the gap to the next float is half the gap
    above, so the shortest text can lie above the value while the correctly
    rounded spelling of that length, below it, does not read back.
@@ -2784,7 +2821,8 @@ static int64_t gs_fmt_float(uint8_t *dst, int neg, uint64_t frac, int bexp, int 
         for (i = 0; i < n || i <= x; i++) {
             if (i == x + 1) *p++ = '.';
             *p++ = i < n ? dig[i] : '0';
-        }
+)GSRT"
+R"GSRT(        }
         /* A whole number still reads as a float: 1.0, not 1. */
         if (n <= x + 1) {
             *p++ = '.';
@@ -2831,8 +2869,7 @@ GS_API int64_t gs_fmt_quoted(uint8_t *dst, const uint8_t *s, int64_t n) {
     for (int64_t i = 0; i < n; i++) {
         uint8_t c = s[i];
         switch (c) {
-)GSRT"
-R"GSRT(            case '"': *d++ = '\\'; *d++ = '"'; break;
+            case '"': *d++ = '\\'; *d++ = '"'; break;
             case '\\': *d++ = '\\'; *d++ = '\\'; break;
             case '\n': *d++ = '\\'; *d++ = 'n'; break;
             case '\r': *d++ = '\\'; *d++ = 'r'; break;

@@ -579,6 +579,7 @@ fn write_stdout(s: const u8[:])   fn write_stderr(s: const u8[:])   fn flush_std
 fn arg_count() -> i64       fn arg(i: i64, out: u8[>..]&)
 fn args() -> u8[:][>..]                              // indexable; argument 0 is the program
 fn env(name: const u8[:], out: u8[>..]&) -> bool
+fn trim_memory() -> bool                            // return unused data-stack pages to the OS
 fn resource_dir() -> u8[>..]                         // absolute directory, trailing separator
 fn resource_dir(out: u8[>..]&) -> bool               // appends; unchanged on failure
 fn time() -> f64                                     // seconds since the epoch
@@ -587,6 +588,16 @@ fn time_ns() -> i64         fn clock_ns() -> i64
 fn sleep(seconds: f64)      fn sleep_ms(ms: i64)
 fn random_seed() -> u64                              // entropy, for rng
 ```
+
+`trim_memory` asks the OS to discard complete pages beyond every current
+data-stack top in the calling thread program, including its globals and
+scratch from scopes that have ended. It preserves live values, borrowed
+views, limited-array capacity and virtual-address reservations; subsequent
+growth works normally. It affects no other worker. The compiler synchronizes
+cached tops through indirect helper calls as well as direct calls. Use it
+after a large workload, such as replacing a document, rather than on every
+temporary: ordinary scope exit still keeps pages available for cheap reuse.
+The OS can defer reclamation; `false` means at least one OS request failed.
 
 Paths are UTF-8 on every platform: on Windows the runtime converts them to
 UTF-16 for the system's wide APIs. So are environment values, and the
