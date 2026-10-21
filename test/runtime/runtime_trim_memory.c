@@ -1,6 +1,7 @@
-/* Direct runtime checks: actually decommit unused Windows pages, keep live
-   partial pages and other stacks, and recommit through the fault handler.
-   This runs beside the Goose fixture in both CI profiles. */
+/* Direct runtime checks: actually decommit unused Windows pages (and drop
+   them from Linux's resident set), keep live partial pages and other
+   stacks, and recommit through the fault handler. This runs beside the
+   Goose fixture in both CI profiles. */
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -21,9 +22,29 @@ static void check(int ok, const char *what) {
     if (!ok) { fprintf(stderr, "trim memory check failed: %s\n", what); exit(2); }
 }
 
+/* The registry entry of the region starting at base. */
+static const gs_region *region_of(const uint8_t *base) {
+    for (long i = 0; i < gs_nregions; i++)
+        if (gs_regions[i].base == base) return &gs_regions[i];
+    check(0, "region registered");
+    return NULL;
+}
+
+#ifdef __linux__
+/* Whether the page holding p is resident. */
+static int resident(const uint8_t *p) {
+    unsigned char v = 0;
+    uintptr_t page = (uintptr_t)p / gs_page_size * gs_page_size;
+    check(mincore((void *)page, gs_page_size, &v) == 0, "mincore");
+    return v & 1;
+}
+#endif
+
 int main(int argc, char **argv) {
     gs_rt_init(argc, argv, 2, 3, 0);
     uint8_t *base = GS(0)->top;
+    /* The platform may have halved the reservation (gs_reserve_region). */
+    const gs_region *r0 = region_of(base);
     uint8_t *other = GS(1)->top;
     gs_stack global; gs_stack_init(&global);
     uint8_t *global_base = global.top;
@@ -39,13 +60,23 @@ int main(int argc, char **argv) {
         GS(0)->top = base + keep;
         check(gs_trim_memory(), "trim after shrink");
         check(gs_trim_memory(), "repeat trim is harmless");
+        size_t start = (keep + gs_page_size - 1) / gs_page_size * gs_page_size;
 #ifdef _WIN32
         MEMORY_BASIC_INFORMATION info;
-        size_t start = (keep + gs_page_size - 1) / gs_page_size * gs_page_size;
         check(VirtualQuery(base + start, &info, sizeof info) != 0, "query discarded page");
         check(info.State == MEM_RESERVE, "unused page really decommitted");
-        check(VirtualQuery(base + GS_STACK_RESERVE, &info, sizeof info) != 0 &&
+        check(VirtualQuery(base + count - 1, &info, sizeof info) != 0 &&
+              info.State == MEM_RESERVE, "last used page decommitted");
+        check(VirtualQuery(base + r0->usable, &info, sizeof info) != 0 &&
               info.State == MEM_RESERVE, "guard gap remains uncommitted");
+        /* The next trim starts its walk from here, not the reservation's end. */
+        check(r0->committed == base + start, "commit mark follows the trim");
+#else
+        (void)r0;
+#endif
+#ifdef __linux__
+        check(!resident(base + start), "unused page leaves the resident set");
+        check(!resident(base + count - 1), "last used page leaves the resident set");
 #endif
         for (size_t i = 0; i < keep; i++) check(base[i] == 85, "live prefix survives");
         for (size_t i = 0; i < 8197; i++) {
@@ -55,6 +86,9 @@ int main(int argc, char **argv) {
         GS(0)->top = base + count;
         memset(base + keep, 93, count - keep);
         for (size_t i = keep; i < count; i++) check(base[i] == 93, "regrowth recommits");
+#ifdef _WIN32
+        check(r0->committed >= base + count, "fault handler raises the commit mark");
+#endif
     }
     /* As a thread program's end does: its stack block, then its regions. */
     gs_thread_release();

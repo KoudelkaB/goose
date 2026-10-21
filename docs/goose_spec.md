@@ -81,8 +81,7 @@ Rewinding a data stack makes its storage reusable, while normally keeping
 its pages committed. After a large workload, `trim_memory()` from `os`
 can ask the operating system to discard unused complete pages of the
 calling thread program's stacks. This preserves all live values and the
-virtual reservations; subsequent growth remains valid. Physical reclamation
-may be deferred by the operating system.
+virtual reservations; subsequent growth remains valid.
 
 ### 1.3 The stack invariant
 

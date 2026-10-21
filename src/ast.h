@@ -1464,6 +1464,10 @@ struct SFunction {
     // The shared library an extern block binds it from by that symbol as
     // the program starts (§7.10); empty for an extern the link resolves.
     string dylib;
+    // An extern that reads every data-stack top of its thread program
+    // (os.trim_memory): each caller, and transitively theirs, publishes all
+    // of its cached tops before the call (CodeGen::CollectSpecs, SyncReach).
+    bool readsalltops = false;
     bool isnested = false;
     SFunction *outer = nullptr;     // The function a nested one is declared in.
     Block *body = nullptr;

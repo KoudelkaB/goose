@@ -842,7 +842,9 @@ GS_API void gs_rt_start(int argc, char **argv, uint64_t reserve, uint64_t gap,
 /* A fresh region, registered to the calling thread program. */
 GS_API uint8_t *gs_reserve_region(gs_stack *stack);
 /* Discard unused complete pages of this thread program's data stacks.
-   Generated callers synchronize cached tops before entering the runtime. */
+   For generated code only (os.trim_memory), whose callers write back their
+   cached tops first; C called from Goose must not call it. 0 means an OS
+   request failed; a top outside its region panics. */
 GS_API uint8_t gs_trim_memory(void);
 /* The calling thread program's stack use, on stderr (GS_STACK_STATS):
    `stacks` is how many of its indexed data stacks exist. */
@@ -884,10 +886,10 @@ GS_API int64_t gs_hardware_threads(void);
    abort ends run early. */
 GS_API int64_t gs_thread_start(void (*run)(void (*)(uint8_t *), uint8_t *),
                                void (*release)(void), void (*entry)(uint8_t *),
-                               const void *args, int64_t argsize, int contained);
-/* Whether the worker returned rather than aborted, once it has ended. Where
 )GSRT"
-R"GSRT(   `msg` is not NULL, the first such wait for a worker that aborted takes its
+R"GSRT(                               const void *args, int64_t argsize, int contained);
+/* Whether the worker returned rather than aborted, once it has ended. Where
+   `msg` is not NULL, the first such wait for a worker that aborted takes its
    message: `msg` and `len` are set to it, which the caller frees with
    gs_free_msg, or to NULL and no bytes. */
 GS_API uint8_t gs_thread_wait(int64_t id, uint8_t **msg, int64_t *len,
@@ -1080,13 +1082,13 @@ static int64_t gs_zig_write(uint8_t *p, int64_t v) {
 
 /* The ULEB128 at p, or 0 if it runs past `end`, past ten bytes, or carries
    payload bits above the 64th, or is not shortest. The result is the byte count. */
-static int64_t gs_uleb_check(const uint8_t *p, const uint8_t *end, uint64_t *out) {
+)GSRT"
+R"GSRT(static int64_t gs_uleb_check(const uint8_t *p, const uint8_t *end, uint64_t *out) {
     uint64_t v = 0;
     int shift = 0;
     const uint8_t *q = p;
     for (;;) {
-)GSRT"
-R"GSRT(        uint8_t b;
+        uint8_t b;
         if (q >= end) return 0;
         b = *q++;
         if (shift > 63 || (shift == 63 && (b & 0x7e))) return 0;
@@ -1355,6 +1357,11 @@ typedef struct {
     uint8_t *base;
     size_t usable, size;    /* size: with the guard gap */
     gs_stack *stack;       /* Stable descriptor of the owning data stack. */
+    /* Windows: one past the highest page the fault handler has committed,
+       so gs_trim_memory decommits only what was ever committed rather than
+       walking the whole reservation. Unused on POSIX, which commits on
+       touch with no fault to note it. */
+    uint8_t *committed;
 } gs_region;
 static GS_TLS gs_region *gs_regions;
 static GS_TLS volatile long gs_nregions;
@@ -1470,7 +1477,7 @@ static LONG WINAPI gs_fault_filter(EXCEPTION_POINTERS *ep) {
         return EXCEPTION_CONTINUE_SEARCH;
     uint8_t *hit = (uint8_t *)ep->ExceptionRecord->ExceptionInformation[1];
     for (long i = 0; i < gs_nregions; i++) {
-        const gs_region *r = &gs_regions[i];
+        gs_region *r = &gs_regions[i];
         if ((uintptr_t)hit - (uintptr_t)r->base < r->size) {
             /* Within the usable part: commit another chunk (clamped to the
                region) and resume, or where the system has no more memory to
@@ -1480,8 +1487,10 @@ static LONG WINAPI gs_fault_filter(EXCEPTION_POINTERS *ep) {
                 size_t n = GS_COMMIT_CHUNK;
                 if (page + n > r->base + r->usable)
                     n = (size_t)(r->base + r->usable - page);
-                if (VirtualAlloc(page, n, MEM_COMMIT, PAGE_READWRITE))
+                if (VirtualAlloc(page, n, MEM_COMMIT, PAGE_READWRITE)) {
+                    if (page + n > r->committed) r->committed = page + n;
                     return EXCEPTION_CONTINUE_EXECUTION;
+                }
                 static const char nomem[] =
                     "goose runtime error: out of memory committing a data stack\n";
                 DWORD written;
@@ -1558,7 +1567,8 @@ static GS_NORETURN void gs_park(void) {
 
 /* The calling thread's native stack, from GS_NATIVE_SLOP below its lowest
    usable address up to its top: a fault in there is that stack overflowing,
-   whether on the guard below it or at a limit the kernel would not grow it
+)GSRT"
+R"GSRT(   whether on the guard below it or at a limit the kernel would not grow it
    past. The slop covers a frame larger than the guard reaching over it.
    Empty where the platform cannot tell. */
 #define GS_NATIVE_SLOP (64u << 10)
@@ -1566,8 +1576,7 @@ static GS_TLS uintptr_t gs_native_lo, gs_native_hi;
 /* The alternate signal stack gs_native_stack_init allocated, if it did. */
 static GS_TLS void *gs_sigstack;
 #define GS_SIGSTACK_MIN (64u << 10)
-)GSRT"
-R"GSRT(/* What the fault handler replaced, for the faults that are not its own. */
+/* What the fault handler replaced, for the faults that are not its own. */
 static struct sigaction gs_prev_segv, gs_prev_bus;
 
 static void gs_fault_handler(int sig, siginfo_t *info, void *ctx) {
@@ -1599,7 +1608,11 @@ static size_t gs_os_page_size(void) {
     return n > 0 ? (size_t)n : 4096;
 }
 
+/* For gs_trim_memory, which discards whole pages only. */
+static size_t gs_page_size = 0;
+
 static void gs_regions_init(void) {
+    gs_page_size = gs_os_page_size();
     struct sigaction sa;
     memset(&sa, 0, sizeof(sa));
     sa.sa_sigaction = gs_fault_handler;
@@ -1751,6 +1764,7 @@ GS_API uint8_t *gs_reserve_region(gs_stack *stack) {
     gs_regions[i].usable = usable;
     gs_regions[i].size = usable + gs_region_gap;
     gs_regions[i].stack = stack;
+    gs_regions[i].committed = p;
     gs_nregions = i + 1;  /* Publish only the initialized entry. */
     return p;
 }
@@ -1759,30 +1773,51 @@ GS_API uint8_t *gs_reserve_region(gs_stack *stack) {
    pages cheaply, while a long-running application can give them back after
    replacing a large document. Keep the virtual reservation and the partly
    used final page; limited-array capacity and live borrowed values are below
-   the synchronized top and remain intact. Each worker has its own registry. */
+   the synchronized top and remain intact. Each worker has its own registry.
+
+   Eager on purpose: Windows decommits, which returns the commit charge as
+   well as the physical pages (DiscardVirtualMemory and MEM_RESET keep the
+   charge), and Linux's MADV_DONTNEED drops the pages from RSS at once,
+   where MADV_FREE leaves them counted until the kernel is short of memory.
+)GSRT"
+R"GSRT(   On macOS MADV_DONTNEED reclaims nothing reliably; MADV_FREE_REUSABLE is
+   what makes the footprint drop there.
+
+   Only generated code may call this, through os.trim_memory, whose callers
+   publish their cached tops first (SFunction::readsalltops). C reached
+   from Goose through another extern must not: tops cached by the Goose
+   frames above it would still be stale, and live pages above them lost. */
 GS_API uint8_t gs_trim_memory(void) {
-#ifdef _WIN32
-    size_t page = gs_page_size;
-#else
-    long page_size = sysconf(_SC_PAGESIZE);
-    if (page_size <= 0) return 0;
-    size_t page = (size_t)page_size;
-#endif
+    uintptr_t page = (uintptr_t)gs_page_size;
     int ok = 1;
     for (long i = 0; i < gs_nregions; i++) {
-        const gs_region *r = &gs_regions[i];
+        gs_region *r = &gs_regions[i];
         uintptr_t base = (uintptr_t)r->base, top = (uintptr_t)r->stack->top;
-        if (top < base || top - base > r->usable) { ok = 0; continue; }
+        /* A top outside its own region is a compiler or runtime bug, not
+           something the OS refused: carrying on could discard live data. */
+        if (top < base || top - base > r->usable)
+            gs_panic("data stack top outside its region in trim_memory");
         uintptr_t start = (top + page - 1) / page * page;
         uintptr_t end = (base + r->usable) / page * page;
-        if (start >= end) continue;
 #ifdef _WIN32
-        /* Decommitting reserved, already uncommitted pages is harmless.
-           The existing access-fault handler commits them again on growth. */
-        if (!VirtualFree((void *)start, (size_t)(end - start), MEM_DECOMMIT)) ok = 0;
+        /* Nothing above the commit mark was ever committed (base is
+           allocation-aligned and the mark page-aligned). */
+        if ((uintptr_t)r->committed < end) end = (uintptr_t)r->committed;
+        if (start >= end) continue;
+        /* The access-fault handler commits the pages again on growth. */
+        if (VirtualFree((void *)start, (size_t)(end - start), MEM_DECOMMIT))
+            r->committed = (uint8_t *)start;
+        else
+            ok = 0;
 #else
-)GSRT"
-R"GSRT(        if (madvise((void *)start, (size_t)(end - start), MADV_DONTNEED)) ok = 0;
+        if (start >= end) continue;
+        /* An untouched stretch costs the kernel little: it skips page
+           tables that were never populated. */
+    #if defined(__APPLE__) && defined(MADV_FREE_REUSABLE)
+        if (madvise((void *)start, (size_t)(end - start), MADV_FREE_REUSABLE)) ok = 0;
+    #else
+        if (madvise((void *)start, (size_t)(end - start), MADV_DONTNEED)) ok = 0;
+    #endif
 #endif
     }
     return (uint8_t)ok;
@@ -1947,7 +1982,8 @@ static int64_t gs_sp_find(gs_sppath *p, int64_t idx) {
     return k - 1;
 }
 
-/* A node full at the root splits under a new root of the two halves. */
+)GSRT"
+R"GSRT(/* A node full at the root splits under a new root of the two halves. */
 static void gs_sp_newroot(gs_sppath *p, int64_t a, int64_t b, int leaf) {
     int64_t r = gs_sp_newnode(p);
     gs_spinner *rn = GS_SPINNER(p, r);
@@ -1998,8 +2034,7 @@ static void gs_sp_addchild(gs_sppath *p, int64_t l, int64_t k, int64_t child, in
         }
         /* The node keeps its place above, and its new right half goes
            after it. */
-)GSRT"
-R"GSRT(        gs_sp_fix(p, l, INT64_MAX, 0);
+        gs_sp_fix(p, l, INT64_MAX, 0);
         child = nn;
         leaf = 0;
         k = p->pos[l - 1] + 1;
@@ -2177,7 +2212,8 @@ GS_API int64_t gs_spans_alloc(uint8_t *base, int64_t *n, uint8_t **top, int64_t 
 
 /* The spans around a run [idx, end): the path to the leaf holding the last
    span that starts at or before idx (its position k there, or -1), and the
-   span after that one where it follows in the same leaf, or where it starts
+)GSRT"
+R"GSRT(   span after that one where it follows in the same leaf, or where it starts
    the next leaf and at end (nl and nk, reached by the path np). A next
    leaf's first index is the key of the entry that leads to it, so a path
    to it is only made where its first span touches the run. */
@@ -2228,8 +2264,7 @@ static void gs_sp_release(gs_sppath *p, gs_spnear *s, int64_t idx, int64_t cnt) 
         lf->cnt[k] = m;
         /* The merged count is larger than both it replaces, so one fix
            covers the span after leaving the leaf as well. */
-)GSRT"
-R"GSRT(        if (next && nl == lf) gs_sp_close(lf, nk);
+        if (next && nl == lf) gs_sp_close(lf, nk);
         gs_sp_fix(p, p->h, c, m);
         if (next && nl != lf) gs_sp_delete(s->np, nk);
     } else if (next) {
@@ -2393,7 +2428,8 @@ static GS_INLINE void gs_bsm_init(gs_bsm *m, const gs_byteset *s, int tables) {
         m->flip = _mm_setzero_si128();
     } else {
         m->a = _mm_set1_epi8((char)s->bytes[0]);
-        m->b = _mm_set1_epi8((char)s->bytes[1]);
+)GSRT"
+R"GSRT(        m->b = _mm_set1_epi8((char)s->bytes[1]);
         m->c = _mm_set1_epi8((char)s->bytes[2]);
         m->flip = s->invert ? _mm_set1_epi8(-1) : _mm_setzero_si128();
     }
@@ -2434,8 +2470,7 @@ static GS_SSSE3 GS_INLINE __m128i gs_bsm_tables(const gs_bsm *m, __m128i x) {
    finds in a block. */
 #define GS_ANY_LOOP(TEST)                                                              \
     int64_t i = 0;                                                                     \
-)GSRT"
-R"GSRT(    unsigned k;                                                                        \
+    unsigned k;                                                                        \
     for (; i + 16 <= n; i += 16) {                                                     \
         k = (unsigned)_mm_movemask_epi8(TEST(GS_LOAD(p + i)));                         \
         if (k) return i + gs_ctz32(k);                                                 \
@@ -2561,7 +2596,8 @@ GS_API void gs_rt_start(int argc, char **argv, uint64_t reserve, uint64_t gap,
     if (!reserve) gs_panic("the data stack reservation (GS_STACK_RESERVE) is less than a page");
     gs_region_usable = gs_region_reserve = (size_t)reserve;
     gs_region_gap = (size_t)gap;
-    gs_stack_budget = budget;
+)GSRT"
+R"GSRT(    gs_stack_budget = budget;
     gs_mainregions = mainregions;
     gs_workerregions = workerregions;
     /* The workers the budget holds beside the main program, each at the
@@ -2601,8 +2637,7 @@ GS_API void gs_rt_start(int argc, char **argv, uint64_t reserve, uint64_t gap,
 /* Integers are written by a digit loop rather than printf, whose locale
    handling and format parsing cost several times the conversion itself:
    the digit count first, then the digits from the right, two per division
-)GSRT"
-R"GSRT(   by 100. */
+   by 100. */
 static const char gs_digit_pairs[201] =
     "00010203040506070809101112131415161718192021222324252627282930313233343536373839"
     "40414243444546474849505152535455565758596061626364656667686970717273747576777879"
@@ -2772,7 +2807,8 @@ static int gs_float_digits(uint64_t f, int e, int bits, int emin, char *dig, int
         if (!low && !high) {
             dig[n++] = (char)('0' + d);
             continue;
-        }
+)GSRT"
+R"GSRT(        }
         if (low && high) {
             /* Both read back: the nearer, d + 1 when r is past half of s,
                and of two as near, the even one. */
@@ -2821,8 +2857,7 @@ static int64_t gs_fmt_float(uint8_t *dst, int neg, uint64_t frac, int bexp, int 
         for (i = 0; i < n || i <= x; i++) {
             if (i == x + 1) *p++ = '.';
             *p++ = i < n ? dig[i] : '0';
-)GSRT"
-R"GSRT(        }
+        }
         /* A whole number still reads as a float: 1.0, not 1. */
         if (n <= x + 1) {
             *p++ = '.';

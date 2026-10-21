@@ -8,7 +8,7 @@ import std;
 // Return unused complete pages of this thread program's data stacks to the
 // OS. Live values, limited-array capacity and virtual reservations remain;
 // future growth still works. Call after a large workload, not for every
-// temporary. The OS may defer reclamation. False means an OS request failed.
+// temporary. False means an OS request failed.
 extern fn trim_memory() -> bool = "gs_trim_memory";
 
 // Files. Paths are UTF-8 everywhere, Windows included.

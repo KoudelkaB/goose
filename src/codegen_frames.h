@@ -157,7 +157,7 @@ inline void CodeGen::CollectSpecs() {
             // (GenAdtAdapted).
             if (auto from = AdtFrom(n)) si.needssp |= NeedsStack(from);
             if (auto c = Is<Call>(n)) {
-                if (c->spec && c->spec->sf->isextern && c->spec->sf->cname == "gs_trim_memory")
+                if (c->spec && c->spec->sf->isextern && c->spec->sf->readsalltops)
                     si.trims_memory = true;
                 auto add = [&](FnSpec *k) {
                     pair<FnSpec *, const Call *> e { k, c->fvremap.empty() ? nullptr : c };

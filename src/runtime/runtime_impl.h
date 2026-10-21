@@ -196,6 +196,11 @@ typedef struct {
     uint8_t *base;
     size_t usable, size;    /* size: with the guard gap */
     gs_stack *stack;       /* Stable descriptor of the owning data stack. */
+    /* Windows: one past the highest page the fault handler has committed,
+       so gs_trim_memory decommits only what was ever committed rather than
+       walking the whole reservation. Unused on POSIX, which commits on
+       touch with no fault to note it. */
+    uint8_t *committed;
 } gs_region;
 static GS_TLS gs_region *gs_regions;
 static GS_TLS volatile long gs_nregions;
@@ -311,7 +316,7 @@ static LONG WINAPI gs_fault_filter(EXCEPTION_POINTERS *ep) {
         return EXCEPTION_CONTINUE_SEARCH;
     uint8_t *hit = (uint8_t *)ep->ExceptionRecord->ExceptionInformation[1];
     for (long i = 0; i < gs_nregions; i++) {
-        const gs_region *r = &gs_regions[i];
+        gs_region *r = &gs_regions[i];
         if ((uintptr_t)hit - (uintptr_t)r->base < r->size) {
             /* Within the usable part: commit another chunk (clamped to the
                region) and resume, or where the system has no more memory to
@@ -321,8 +326,10 @@ static LONG WINAPI gs_fault_filter(EXCEPTION_POINTERS *ep) {
                 size_t n = GS_COMMIT_CHUNK;
                 if (page + n > r->base + r->usable)
                     n = (size_t)(r->base + r->usable - page);
-                if (VirtualAlloc(page, n, MEM_COMMIT, PAGE_READWRITE))
+                if (VirtualAlloc(page, n, MEM_COMMIT, PAGE_READWRITE)) {
+                    if (page + n > r->committed) r->committed = page + n;
                     return EXCEPTION_CONTINUE_EXECUTION;
+                }
                 static const char nomem[] =
                     "goose runtime error: out of memory committing a data stack\n";
                 DWORD written;
@@ -439,7 +446,11 @@ static size_t gs_os_page_size(void) {
     return n > 0 ? (size_t)n : 4096;
 }
 
+/* For gs_trim_memory, which discards whole pages only. */
+static size_t gs_page_size = 0;
+
 static void gs_regions_init(void) {
+    gs_page_size = gs_os_page_size();
     struct sigaction sa;
     memset(&sa, 0, sizeof(sa));
     sa.sa_sigaction = gs_fault_handler;
@@ -591,6 +602,7 @@ GS_API uint8_t *gs_reserve_region(gs_stack *stack) {
     gs_regions[i].usable = usable;
     gs_regions[i].size = usable + gs_region_gap;
     gs_regions[i].stack = stack;
+    gs_regions[i].committed = p;
     gs_nregions = i + 1;  /* Publish only the initialized entry. */
     return p;
 }
@@ -599,29 +611,50 @@ GS_API uint8_t *gs_reserve_region(gs_stack *stack) {
    pages cheaply, while a long-running application can give them back after
    replacing a large document. Keep the virtual reservation and the partly
    used final page; limited-array capacity and live borrowed values are below
-   the synchronized top and remain intact. Each worker has its own registry. */
+   the synchronized top and remain intact. Each worker has its own registry.
+
+   Eager on purpose: Windows decommits, which returns the commit charge as
+   well as the physical pages (DiscardVirtualMemory and MEM_RESET keep the
+   charge), and Linux's MADV_DONTNEED drops the pages from RSS at once,
+   where MADV_FREE leaves them counted until the kernel is short of memory.
+   On macOS MADV_DONTNEED reclaims nothing reliably; MADV_FREE_REUSABLE is
+   what makes the footprint drop there.
+
+   Only generated code may call this, through os.trim_memory, whose callers
+   publish their cached tops first (SFunction::readsalltops). C reached
+   from Goose through another extern must not: tops cached by the Goose
+   frames above it would still be stale, and live pages above them lost. */
 GS_API uint8_t gs_trim_memory(void) {
-#ifdef _WIN32
-    size_t page = gs_page_size;
-#else
-    long page_size = sysconf(_SC_PAGESIZE);
-    if (page_size <= 0) return 0;
-    size_t page = (size_t)page_size;
-#endif
+    uintptr_t page = (uintptr_t)gs_page_size;
     int ok = 1;
     for (long i = 0; i < gs_nregions; i++) {
-        const gs_region *r = &gs_regions[i];
+        gs_region *r = &gs_regions[i];
         uintptr_t base = (uintptr_t)r->base, top = (uintptr_t)r->stack->top;
-        if (top < base || top - base > r->usable) { ok = 0; continue; }
+        /* A top outside its own region is a compiler or runtime bug, not
+           something the OS refused: carrying on could discard live data. */
+        if (top < base || top - base > r->usable)
+            gs_panic("data stack top outside its region in trim_memory");
         uintptr_t start = (top + page - 1) / page * page;
         uintptr_t end = (base + r->usable) / page * page;
-        if (start >= end) continue;
 #ifdef _WIN32
-        /* Decommitting reserved, already uncommitted pages is harmless.
-           The existing access-fault handler commits them again on growth. */
-        if (!VirtualFree((void *)start, (size_t)(end - start), MEM_DECOMMIT)) ok = 0;
+        /* Nothing above the commit mark was ever committed (base is
+           allocation-aligned and the mark page-aligned). */
+        if ((uintptr_t)r->committed < end) end = (uintptr_t)r->committed;
+        if (start >= end) continue;
+        /* The access-fault handler commits the pages again on growth. */
+        if (VirtualFree((void *)start, (size_t)(end - start), MEM_DECOMMIT))
+            r->committed = (uint8_t *)start;
+        else
+            ok = 0;
 #else
+        if (start >= end) continue;
+        /* An untouched stretch costs the kernel little: it skips page
+           tables that were never populated. */
+    #if defined(__APPLE__) && defined(MADV_FREE_REUSABLE)
+        if (madvise((void *)start, (size_t)(end - start), MADV_FREE_REUSABLE)) ok = 0;
+    #else
         if (madvise((void *)start, (size_t)(end - start), MADV_DONTNEED)) ok = 0;
+    #endif
 #endif
     }
     return (uint8_t)ok;

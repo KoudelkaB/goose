@@ -593,11 +593,14 @@ fn random_seed() -> u64                              // entropy, for rng
 data-stack top in the calling thread program, including its globals and
 scratch from scopes that have ended. It preserves live values, borrowed
 views, limited-array capacity and virtual-address reservations; subsequent
-growth works normally. It affects no other worker. The compiler synchronizes
-cached tops through indirect helper calls as well as direct calls. Use it
-after a large workload, such as replacing a document, rather than on every
-temporary: ordinary scope exit still keeps pages available for cheap reuse.
-The OS can defer reclamation; `false` means at least one OS request failed.
+growth works normally. It affects no other worker. Use it after a large
+workload, such as replacing a document, rather than on every temporary:
+ordinary scope exit still keeps pages available for cheap reuse, while
+trimmed pages cost a fault and fresh zeroed pages when the stack grows
+again. The release is eager: Windows decommits the pages, returning their
+commit charge too, and Linux drops them from the resident set at once;
+macOS marks them reusable, which takes them out of the footprint. `false`
+means at least one OS request failed.
 
 Paths are UTF-8 on every platform: on Windows the runtime converts them to
 UTF-16 for the system's wide APIs. So are environment values, and the
